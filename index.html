@@ -1191,6 +1191,9 @@ button / .actbtn     按钮
 <div class="inp-row"><input type="text" class="inp" id="wdUrl" placeholder="WebDAV 地址 如 https://dav.jianguoyun.com/dav/"></div>
 <div class="inp-row"><input type="text" class="inp" id="wdUser" placeholder="账号（邮箱）"></div>
 <div class="inp-row"><input type="password" class="inp" id="wdPass" placeholder="密码（坚果云用「应用密码」）"></div>
+<div class="inp-row"><input type="url" class="inp" id="wdProxyUrl" placeholder="网页代理地址，如 https://你的代理.workers.dev/"></div>
+<div class="inp-row"><input type="password" class="inp" id="wdProxyToken" placeholder="代理访问口令（与代理的 PROXY_TOKEN 一致）"></div>
+<p style="font-size:11px;color:var(--ink3)">网页版连接坚果云需填写自己的代理地址与口令。保留原 WebDAV 地址；换设备先从云端恢复，再备份。此功能为手动同步，请勿在多台设备同时上传。</p>
 <div class="act-row">
   <button class="actbtn" onclick="saveWebdavConfig()">保存参数</button>
   <button class="actbtn" style="border-color:rgba(16,185,129,.4);color:#10b981" onclick="testWebdav()">🔗 测试连接</button>
@@ -5724,7 +5727,8 @@ function busyHide(){document.getElementById('busyMask').classList.remove('show')
 // 说明：每张卡单独存为一个文件（原始文件直传），云端 Index.json 记录指纹。
 // 推送/拉取都是增量的，流量用完中断后，下次继续只补没传完的部分。
 // ============================================================
-let webdavConfig = { url:'', user:'', pass:'', autoSync:false };
+let webdavConfig = { url:'', user:'', pass:'', proxyUrl:'', proxyToken:'', autoSync:false };
+let wdSyncBusy=false;
 
 // 内容指纹：基于卡片原始数据算 hash，用于判断云端是否已是最新
 function cardHash(str){
@@ -5751,6 +5755,8 @@ async function loadWebdavConfig(){
   if(g('wdUrl'))g('wdUrl').value=webdavConfig.url||'';
   if(g('wdUser'))g('wdUser').value=webdavConfig.user||'';
   if(g('wdPass'))g('wdPass').value=webdavConfig.pass||'';
+  if(g('wdProxyUrl'))g('wdProxyUrl').value=webdavConfig.proxyUrl||'';
+  if(g('wdProxyToken'))g('wdProxyToken').value=webdavConfig.proxyToken||'';
   if(g('wdAutoSync'))g('wdAutoSync').checked=!!webdavConfig.autoSync;
   try{ const l=await dbG('meta','webdavSyncTime'); if(l&&l.value&&g('wdLastSync')) g('wdLastSync').textContent='上次同步：'+new Date(l.value).toLocaleString(); }catch(e){}
 }
@@ -5759,6 +5765,8 @@ function saveWebdavConfig(){
   webdavConfig.url=(g('wdUrl').value||'').trim();
   webdavConfig.user=(g('wdUser').value||'').trim();
   webdavConfig.pass=g('wdPass').value||'';
+  webdavConfig.proxyUrl=(g('wdProxyUrl').value||'').trim();
+  webdavConfig.proxyToken=g('wdProxyToken').value||'';
   dbP('meta',{key:'webdavConfig',value:webdavConfig});
   showToast('云同步参数已保存');
 }
@@ -5767,8 +5775,20 @@ function wdToggleAutoSync(chk){ webdavConfig.autoSync=!!chk; dbP('meta',{key:'we
 // WebDAV 请求：基础认证 + 自动补斜杠
 async function wdFetch(path, opts={}){
   let base=webdavConfig.url||''; if(base&&!base.endsWith('/')) base+='/';
-  const b64=btoa(unescape(encodeURIComponent(webdavConfig.user+':'+webdavConfig.pass)));
-  return fetch(base+path, { ...opts, headers:{ 'Authorization':'Basic '+b64, ...(opts.headers||{}) } });
+  const target=new URL(base+path);
+  const headers=new Headers(opts.headers||{});
+  headers.set('Authorization','Basic '+btoa(unescape(encodeURIComponent(webdavConfig.user+':'+webdavConfig.pass))));
+  let url=target.href;
+  if(webdavConfig.proxyUrl){
+    const proxy=new URL(webdavConfig.proxyUrl);
+    if(proxy.protocol!=='https:')throw new Error('代理地址必须使用 HTTPS');
+    if(target.origin!=='https://dav.jianguoyun.com'||!target.pathname.startsWith('/dav/'))throw new Error('此代理只支持坚果云 /dav/ 地址');
+    if(!webdavConfig.proxyToken)throw new Error('请填写代理访问口令');
+    proxy.pathname=target.pathname; proxy.search=target.search; proxy.hash='';
+    headers.set('X-Proxy-Token',webdavConfig.proxyToken); url=proxy.href;
+  }
+  try{return await fetch(url,{...opts,headers,credentials:'omit',cache:'no-store'})}
+  catch(e){throw new Error(webdavConfig.proxyUrl?'无法访问代理，请检查地址、部署和网络：'+e.message:'无法直接连接 WebDAV；坚果云网页版需配置自己的代理：'+e.message)}
 }
 
 async function testWebdav(){
@@ -5784,41 +5804,46 @@ async function testWebdav(){
 
 // 读取云端索引（含每张卡的指纹映射）
 async function wdReadIndex(base){
-  let cloudHashes={}, fileMap={}, meta={};
-  try{
-    const r=await wdFetch(base+'Index.json');
-    if(r.ok){
-      const idx=await r.json();
-      meta=idx.meta||{};
-      fileMap=idx.fileMap||{};
-      if(idx.inventory_hash){
-        idx.inventory_hash.split('|').forEach(s=>{ const[id,h]=s.split(':'); if(id&&h)cloudHashes[id]=h; });
-      }
-    }
-  }catch(e){}
-  return {cloudHashes,fileMap,meta};
+  const r=await wdFetch(base+'Index.json');
+  if(r.status===404)return {cloudHashes:{},fileMap:{},meta:{}};
+  if(!r.ok)throw new Error('读取云端索引失败 HTTP '+r.status+'，已停止上传');
+  const idx=await r.json();
+  if(!idx||typeof idx!=='object'||!idx.fileMap||typeof idx.fileMap!=='object'||Array.isArray(idx.fileMap))throw new Error('云端索引格式异常，已停止上传');
+  const cloudHashes={};
+  if(idx.inventory_hash)String(idx.inventory_hash).split('|').forEach(s=>{const [id,h]=s.split(':');if(id&&h)cloudHashes[id]=h});
+  return {cloudHashes,fileMap:idx.fileMap,meta:idx.meta||{}};
 }
 // 写回云端索引：只记录「已确认上传成功」的卡，实现断点续传
 async function wdWriteIndex(base, confirmedMap){
+  const previous=await wdReadIndex(base);
+  confirmedMap={...previous.fileMap,...confirmedMap};
   const inv=Object.keys(confirmedMap).map(id=>id+':'+confirmedMap[id].hash).join('|');
-  const meta={ schema:2, updatedAt:Date.now(), sections:S.sections, groups:S.groups, mainTagLib:S.mainTagLib||{}, subTagLib:S.subTagLib||{}, tagParents:S.tagParents||{} };
+  const old=previous.meta||{};
+  const mergeLib=(a,b)=>{const out={};for(const k of new Set([...Object.keys(a||{}),...Object.keys(b||{})]))out[k]=uniqTags([...(Array.isArray(a?.[k])?a[k]:[]),...(Array.isArray(b?.[k])?b[k]:[])]);return out};
+  const groups=new Map((old.groups||[]).filter(g=>g&&g.id).map(g=>[g.id,g]));for(const g of S.groups)groups.set(g.id,g);
+  const meta={ schema:2, updatedAt:Date.now(), sections:uniqTags([...(old.sections||[]),...S.sections]), groups:[...groups.values()], mainTagLib:mergeLib(old.mainTagLib,S.mainTagLib), subTagLib:mergeLib(old.subTagLib,S.subTagLib), tagParents:mergeTagParentsMaps(old.tagParents||{},S.tagParents||{}) };
   const dump=JSON.stringify({ meta, fileMap:confirmedMap, inventory_hash:inv });
-  await wdFetch(base+'Index.json',{method:'PUT',body:dump});
+  const r=await wdFetch(base+'Index.json',{method:'PUT',body:dump});
+  if(!r.ok)throw new Error('保存云端索引失败 HTTP '+r.status+'，请重试');
 }
 
 // —— 推送：只上传指纹变化或云端缺失的卡，边传边写索引，可续传 ——
 async function syncPush(){
   if(!webdavConfig.url)return showToast('请先配置并保存 WebDAV');
+  if(wdSyncBusy)return showToast('已有云同步任务正在进行');
+  wdSyncBusy=true;
   busyShow('推送到云端','正在读取云端索引…');const base='KakuSync/';
   try{
-    await wdFetch(base,{method:'MKCOL'}).catch(()=>{});const {cloudHashes,fileMap}=await wdReadIndex(base);
-    let confirmedMap={},localInfo={},prepared={},toUpload=[];
+    const mk=await wdFetch(base,{method:'MKCOL'});
+    if(!mk.ok&&mk.status!==405)throw new Error('创建同步目录失败 HTTP '+mk.status);
+    const {cloudHashes,fileMap}=await wdReadIndex(base);
+    let confirmedMap={...fileMap},localInfo={},prepared={},toUpload=[];
     for(const c of S.cards){
       if(c._delAt)continue;const full=await dbG('cards',c.id)||c;
       try{await prepareCardForSync(full)}catch(e){console.warn('prepare sync output',c.id,e);diagEvent('tavern_network','prepare_sync','failed',{error:diagSafeError(e)},'error');continue}
       const h=syncCardFingerprint(full);full.hash=h;c.hash=h;prepared[c.id]=full;await dbP('cards',full).catch(()=>{});
       const safe=(full.name||'card').replace(/[\\/:*?"<>|]/g,'').slice(0,40),ft=String(full.fileType||'').toUpperCase();
-      const ext=ft==='PNG'?'.png':(['JSON','WORLD'].includes(ft)?'.json':ft==='WEBP'?'.webp':ft==='DOCX'?'.docx':'.txt');const file=safe+'_'+c.id+ext;
+      const ext=!full.rawData?'.json':ft==='PNG'?'.png':(['JSON','WORLD'].includes(ft)?'.json':ft==='WEBP'?'.webp':ft==='DOCX'?'.docx':'.txt');const file=safe+'_'+c.id+ext;
       localInfo[c.id]={name:full.name,file,hash:h,kakuMeta:{section:full.section,groupIds:cardGroupIds(full),groupId:cardGroupIds(full)[0]||null,favorite:full.favorite,importedAt:full.importedAt,tags:full.tags||[],sourceTags:full.sourceTags||[],subtags:full.subtags||[],allTags:cardAllTags(full),note:full.note||''}};
       if(cloudHashes[c.id]===h)confirmedMap[c.id]=localInfo[c.id];else toUpload.push(c.id);
     }
@@ -5829,12 +5854,13 @@ async function syncPush(){
       try{
         let put;if(!full||!full.rawData){const body=JSON.stringify(await cardExportObject(full||{}));put=await wdFetch(base+info.file.replace(/\.[^.]+$/,'.json'),{method:'PUT',body})}
         else put=await wdFetch(base+info.file,{method:'PUT',body:du2b(full.rawData)});
-        if(!put.ok)throw new Error('HTTP '+put.status);const oldFile=fileMap?.[id]?.file;if(oldFile&&oldFile!==info.file)await wdFetch(base+oldFile,{method:'DELETE'}).catch(()=>{});
-        confirmedMap[id]=info;ok++;if(ok%10===0)await wdWriteIndex(base,confirmedMap).catch(()=>{});
+        if(!put.ok)throw new Error('HTTP '+put.status);
+        confirmedMap[id]=info;ok++;if(ok%10===0)await wdWriteIndex(base,confirmedMap);
       }catch(e){console.warn('上传失败',id,e)}
     }
     await wdWriteIndex(base,confirmedMap);dbP('meta',{key:'webdavSyncTime',value:Date.now()});busyHide();loadWebdavConfig();showToast('上传完成！本次同步 '+ok+' / '+toUpload.length+' 张'+(ok<toUpload.length?'（部分失败，可再点一次续传）':''));
-  }catch(e){busyHide();showToast('同步失败（可能跨域/流量用尽）：'+e.message)}
+  }catch(e){busyHide();showToast('同步失败：'+e.message)}
+  finally{wdSyncBusy=false}
 }
 
 // —— 拉取：先读索引列出云端卡片，勾选后下载，本地已存在的默认不勾（续传友好）——
@@ -5853,6 +5879,8 @@ async function restoreWebdavMetadataOnly(){if(!_wdPullList.length)return showToa
 
 async function syncPull(){
   if(!webdavConfig.url) return showToast('请先配置并保存 WebDAV');
+  if(wdSyncBusy)return showToast('已有云同步任务正在进行');
+  wdSyncBusy=true;
   busyShow('读取云端','正在获取云端索引…');
   const base='KakuSync/';
   try{
@@ -5881,6 +5909,7 @@ async function syncPull(){
       </label>`).join('');
     busyHide(); openModal('webdavPullModal');
   }catch(e){ busyHide(); showToast('拉取失败：'+e.message); }
+  finally{wdSyncBusy=false}
 }
 function wdCheckNew(){ document.querySelectorAll('.wd-cb').forEach(cb=>{cb.checked=_wdPullList[cb.dataset.idx].isNew}); }
 function wdCheckAll(){ document.querySelectorAll('.wd-cb').forEach(cb=>cb.checked=true); }
@@ -5889,6 +5918,9 @@ function wdCheckNone(){ document.querySelectorAll('.wd-cb').forEach(cb=>cb.check
 async function executeWebdavPull(){
   const sel=Array.from(document.querySelectorAll('.wd-cb:checked')).map(cb=>parseInt(cb.dataset.idx));
   if(!sel.length) return showToast('未勾选任何卡片');
+  if(wdSyncBusy)return showToast('已有云同步任务正在进行');
+  wdSyncBusy=true;
+  try{
   closeModal('webdavPullModal'); busyShow('恢复数据','准备下载…');
   const base='KakuSync/'; let ok=0;
   for(let i=0;i<sel.length;i++){
@@ -5923,6 +5955,7 @@ async function executeWebdavPull(){
   busyHide();
   renderTabs(); renderFilterBar(); renderGrid();
   showToast('恢复完毕！成功下载 '+ok+' / '+sel.length+' 张');
+  }finally{wdSyncBusy=false;busyHide()}
 }
 
 
